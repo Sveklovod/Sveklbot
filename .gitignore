@@ -1,0 +1,29 @@
+# Secrets and local settings
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python environments, caches and logs
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+
+# Private runtime data and Windows binaries
+data/
+backups/
+ffmpeg/
+*.exe
+*.dll
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
+
+# Store personal music on the host, outside the public repository.
+music/**
+!music/test-tone.wav
