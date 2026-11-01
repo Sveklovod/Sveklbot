@@ -582,6 +582,28 @@ async def handle_player_action(interaction: discord.Interaction, action: str) ->
             tracks = available_tracks(state.playlist)
             page, pages = song_page_bounds(state.song_page, len(tracks))
             state.song_page = max(0, min(pages - 1, page + (1 if action == "songs_next" else -1)))
+        elif action == "restart":
+            track = state.track
+            if track is None:
+                await interaction.followup.send(
+                    "Сейчас ничего не играет. Сначала выбери песню.", ephemeral=True
+                )
+                return
+            if not track.is_file():
+                await interaction.followup.send(
+                    "Файл текущей песни удалён или переименован. Выбери песню заново.",
+                    ephemeral=True,
+                )
+                return
+            # Keep the song locally: reconnecting clears stale playback state.
+            voice = await connect_to_user(interaction)
+            if voice is None:
+                return
+            try:
+                start_track(voice, guild.id, state, track)
+            except Exception:
+                state.track = None
+                raise
         elif action == "toggle" and voice is not None and voice.is_connected() and voice.is_paused():
             voice.resume()
         elif action == "toggle" and voice is not None and voice.is_connected() and voice.is_playing():
@@ -768,6 +790,10 @@ class PlayerView(discord.ui.View):
     async def next_track(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await handle_player_action(interaction, "next")
 
+    @discord.ui.button(label="С начала", emoji="⏮️", custom_id="music:restart", row=0)
+    async def restart(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await handle_player_action(interaction, "restart")
+
     @discord.ui.button(label="Песни", emoji="🎵", custom_id="music:songs", row=0)
     async def songs_list(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await handle_player_action(interaction, "songs")
@@ -815,7 +841,8 @@ def build_help_message() -> str:
         "Для конкретной песни используй список «Выбрать песню» под плейлистами "
         "или `/play` и подсказки названий.\n\n"
         "`/songs`, `/play` и переключение треков работают с выбранным плейлистом. "
-        "Громкость меняется без перезапуска песни.\n\n"
+        "Громкость меняется без перезапуска песни. "
+        "Кнопка «С начала» запускает текущую песню заново, в том числе с паузы.\n\n"
         "Управлять музыкой могут участники голосового канала бота; "
         "права администратора не нужны. Справка доступна без входа в голосовой канал."
     )
