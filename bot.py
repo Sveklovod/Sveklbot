@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 import subprocess
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import lru_cache
@@ -72,12 +73,14 @@ class PlaybackState:
     volume_percent: int = 100
     playlist: str = "."
     song_page: int = 0
+    repeat_enabled: bool = False
 
 
 playback: dict[int, PlaybackState] = {}
 player_messages: dict[int, discord.Message | discord.PartialMessage] = {}
 player_locks: dict[int, asyncio.Lock] = {}
 panel_update_locks: dict[int, asyncio.Lock] = {}
+repeat_tasks: set[asyncio.Task[None]] = set()
 
 
 class VoiceConnectionError(RuntimeError):
@@ -87,11 +90,26 @@ class VoiceConnectionError(RuntimeError):
 class ProgressAudio(discord.PCMVolumeTransformer[discord.FFmpegPCMAudio]):
     """Count decoded audio frames; pausing or changing volume never resets time."""
 
-    def __init__(self, source: discord.FFmpegPCMAudio, volume: float) -> None:
+    def __init__(self, source: discord.FFmpegPCMAudio, volume: float, *, position: float = 0.0) -> None:
         super().__init__(source, volume=volume)
         self.frames_read = 0
+        self.start_position = position
+        self._startup_hold = False
+        self._pause_check: Callable[[], bool] | None = None
+
+    def hold_for_pause(self, voice: discord.VoiceClient) -> None:
+        # VoiceClient.play starts its thread immediately. Send only silence
+        # until pause has been applied, then leave the decoder untouched until resume.
+        self._startup_hold = True
+        self._pause_check = voice.is_paused
+
+    def release_startup_hold(self) -> None:
+        self._startup_hold = False
 
     def read(self) -> bytes:
+        if self._startup_hold or (self._pause_check is not None and self._pause_check()):
+            return b"\0" * 3840
+        self._pause_check = None
         data = super().read()
         if not data:
             # discord.py inspects the outer source, so propagate decoder errors
@@ -128,7 +146,7 @@ class ProgressAudio(discord.PCMVolumeTransformer[discord.FFmpegPCMAudio]):
 
     @property
     def position(self) -> float:
-        return self.frames_read * 0.02
+        return self.start_position + self.frames_read * 0.02
 
 
 @lru_cache(maxsize=128)
@@ -157,6 +175,14 @@ def format_time(seconds: float) -> str:
     return f"{minutes:02}:{seconds:02}"
 
 
+async def get_track_duration(track: Path) -> float | None:
+    try:
+        stat = track.stat()
+        return await asyncio.to_thread(track_duration, track, stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        return None
+
+
 def build_player_embed(guild: discord.Guild, duration: float | None) -> discord.Embed:
     state = playback.get(guild.id, PlaybackState())
     voice = guild.voice_client
@@ -174,6 +200,7 @@ def build_player_embed(guild: discord.Guild, duration: float | None) -> discord.
         embed.description = "Музыка остановлена.\nНажми **Пуск / Пауза** или выбери песню командой `/play`."
     embed.add_field(name="Плейлист", value=discord.utils.escape_markdown(playlist_label(state.playlist))[:1024], inline=True)
     embed.add_field(name="Громкость", value=f"{state.volume_percent}%", inline=True)
+    embed.add_field(name="Повтор", value="Одна песня" if state.repeat_enabled else "Выключен", inline=True)
     if voice is not None:
         embed.add_field(name="Канал", value=voice.channel.mention, inline=True)
     embed.set_footer(text="Локальная музыка • обновление каждые 10 с • /player")
@@ -183,13 +210,7 @@ def build_player_embed(guild: discord.Guild, duration: float | None) -> discord.
 async def player_embed(guild: discord.Guild) -> discord.Embed:
     state = playback.get(guild.id)
     track = state.track if state else None
-    duration = None
-    if track is not None:
-        try:
-            stat = track.stat()
-            duration = await asyncio.to_thread(track_duration, track, stat.st_mtime_ns, stat.st_size)
-        except OSError:
-            pass
+    duration = await get_track_duration(track) if track is not None else None
     # Another command could have changed the song while metadata was loading.
     if state is not None and state.track != track:
         duration = None
@@ -315,6 +336,7 @@ def find_track(query: str, playlist: str = ".") -> tuple[Path | None, str | None
 
 class MusicBot(commands.Bot):
     def __init__(self) -> None:
+        self._music_closing = False
         super().__init__(
             command_prefix=commands.when_mentioned,
             intents=discord.Intents.default(),
@@ -334,7 +356,13 @@ class MusicBot(commands.Bot):
         refresh_players.start()
 
     async def close(self) -> None:
+        self._music_closing = True
         refresh_players.cancel()
+        pending = tuple(repeat_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         await super().close()
 
 
@@ -447,24 +475,71 @@ async def connect_to_user(
         return None
 
 
-def finish_track(guild_id: int, serial: int, error: Exception | None) -> None:
+def finish_track(
+    guild_id: int, serial: int, error: Exception | None, frames_read: int | None = None
+) -> None:
     state = playback.get(guild_id)
     if state is not None and state.serial == serial:
-        state.track = None
+        if (error is None and state.repeat_enabled and state.track is not None
+                and frames_read != 0 and not bot._music_closing and not bot.is_closed()):
+            task = asyncio.create_task(repeat_finished_track(guild_id, serial, state.track))
+            repeat_tasks.add(task)
+            task.add_done_callback(repeat_tasks.discard)
+        else:
+            state.track = None
+            if error is not None or frames_read == 0:
+                if state.repeat_enabled and error is None:
+                    logging.warning("Повтор выключен: песня завершилась без аудио, сервер %s", guild_id)
+                state.repeat_enabled = False
     if error is not None:
         logging.error("Ошибка воспроизведения: %s", error)
 
 
+async def repeat_finished_track(guild_id: int, serial: int, track: Path) -> None:
+    # A stop, seek or song selection can arrive before this task takes the lock.
+    # Restart only the completion that still belongs to the current playback.
+    guild = bot.get_guild(guild_id)
+    async with player_locks.setdefault(guild_id, asyncio.Lock()):
+        state = playback.get(guild_id)
+        if state is None or state.serial != serial or state.track != track:
+            return
+        voice = guild.voice_client if guild is not None else None
+        if not state.repeat_enabled or bot._music_closing or bot.is_closed():
+            state.track = None
+        elif voice is None or not voice.is_connected():
+            state.track = None
+            state.repeat_enabled = False
+        elif voice.is_playing() or voice.is_paused():
+            return  # Never interrupt audio that is already active.
+        else:
+            try:
+                if not track.is_file():
+                    raise FileNotFoundError("Файл повторяемой песни удалён или переименован.")
+                start_track(voice, guild_id, state, track)
+            except Exception:
+                state.track = None
+                state.repeat_enabled = False
+                logging.exception("Не удалось повторить песню, сервер %s", guild_id)
+    if guild is not None:
+        try:
+            await refresh_player(guild)
+        except Exception:
+            logging.exception("Не удалось обновить панель после повтора, сервер %s", guild_id)
+
+
 def create_audio_source(
-    track: Path, volume_percent: int
+    track: Path, volume_percent: int, *, position: float = 0.0
 ) -> ProgressAudio:
     """Adjust each PCM frame before native Opus encoding in the audio thread."""
+    if not math.isfinite(position) or position < 0:
+        raise ValueError("Позиция песни должна быть неотрицательным конечным числом.")
     source = discord.FFmpegPCMAudio(
         str(track),
         executable=FFMPEG_EXECUTABLE,
+        before_options=f"-ss {position:.6f}" if position > 0 else None,
         options="-vn",
     )
-    return ProgressAudio(source, volume=volume_percent / 100)
+    return ProgressAudio(source, volume=volume_percent / 100, position=position)
 
 
 def start_track(
@@ -472,7 +547,12 @@ def start_track(
     guild_id: int,
     state: PlaybackState,
     track: Path,
+    *,
+    position: float = 0.0,
+    paused: bool = False,
 ) -> None:
+    if not math.isfinite(position) or position < 0:
+        raise ValueError("Некорректная позиция песни.")
     if not voice_client.is_connected():
         raise VoiceConnectionError("Соединение потеряно до создания аудиопотока.")
     state.serial += 1
@@ -482,17 +562,25 @@ def start_track(
     if voice_client.is_playing() or voice_client.is_paused():
         voice_client.stop()
 
-    source = create_audio_source(track, state.volume_percent)
+    source = (create_audio_source(track, state.volume_percent, position=position)
+              if position else create_audio_source(track, state.volume_percent))
+    if paused:
+        source.hold_for_pause(voice_client)
     try:
         voice_client.play(
             source,
             bitrate=128,
             signal_type="music",
             after=lambda error: bot.loop.call_soon_threadsafe(
-                finish_track, guild_id, serial, error
+                finish_track, guild_id, serial, error, source.frames_read
             ),
         )
+        if paused:
+            voice_client.pause()
+            source.release_startup_hold()
     except Exception as error:
+        if paused:
+            voice_client.stop()
         source.cleanup()
         if isinstance(error, discord.ClientException) and not voice_client.is_connected():
             raise VoiceConnectionError("Соединение потеряно при запуске аудиопотока.") from error
@@ -582,7 +670,7 @@ async def handle_player_action(interaction: discord.Interaction, action: str) ->
             tracks = available_tracks(state.playlist)
             page, pages = song_page_bounds(state.song_page, len(tracks))
             state.song_page = max(0, min(pages - 1, page + (1 if action == "songs_next" else -1)))
-        elif action == "restart":
+        elif action in {"restart", "rewind", "forward"}:
             track = state.track
             if track is None:
                 await interaction.followup.send(
@@ -595,12 +683,46 @@ async def handle_player_action(interaction: discord.Interaction, action: str) ->
                     ephemeral=True,
                 )
                 return
+            position, paused = 0.0, False
+            if action != "restart":
+                source = voice.source if voice is not None else None
+                if not isinstance(source, ProgressAudio) or not (voice.is_playing() or voice.is_paused()):
+                    await interaction.followup.send(
+                        "Сейчас нет песни, которую можно перемотать. Выбери её заново.", ephemeral=True
+                    )
+                    return
+                serial = state.serial
+                duration = await get_track_duration(track)
+                # Audio can end while ffprobe is running; never revive an ended track.
+                if (state.serial != serial or state.track != track or guild.voice_client is not voice
+                        or voice.source is not source or not (voice.is_playing() or voice.is_paused())):
+                    await interaction.followup.send(
+                        "Песня уже завершилась. Выбери её заново.", ephemeral=True
+                    )
+                    return
+                if duration is None:
+                    await interaction.followup.send(
+                        "Не удалось определить длительность песни для перемотки. Повтори попытку.", ephemeral=True
+                    )
+                    return
+                current = source.position
+                position = max(0.0, min(max(0.0, duration - 0.02), current + (-10 if action == "rewind" else 10)))
+                if abs(position - current) < 0.001 or (action == "forward" and position < current):
+                    await interaction.followup.send(
+                        "Достигнуто начало песни." if action == "rewind" else "Достигнут конец песни.",
+                        ephemeral=True,
+                    )
+                    return
+                paused = voice.is_paused()
             # Keep the song locally: reconnecting clears stale playback state.
             voice = await connect_to_user(interaction)
             if voice is None:
                 return
             try:
-                start_track(voice, guild.id, state, track)
+                if action == "restart":
+                    start_track(voice, guild.id, state, track)
+                else:
+                    start_track(voice, guild.id, state, track, position=position, paused=paused)
             except Exception:
                 state.track = None
                 raise
@@ -630,6 +752,8 @@ async def handle_player_action(interaction: discord.Interaction, action: str) ->
             except Exception:
                 state.track = None
                 raise
+        elif action == "loop":
+            state.repeat_enabled = not state.repeat_enabled
         elif action in {"quieter", "louder"}:
             state.volume_percent = max(0, min(200, state.volume_percent + (10 if action == "louder" else -10)))
             if voice is not None and isinstance(voice.source, discord.PCMVolumeTransformer):
@@ -637,6 +761,7 @@ async def handle_player_action(interaction: discord.Interaction, action: str) ->
         elif action == "stop":
             state.serial += 1
             state.track = None
+            state.repeat_enabled = False
             if voice is not None:
                 voice.stop()
         if interaction.message is not None:
@@ -764,6 +889,8 @@ class PlayerView(discord.ui.View):
     def __init__(self, guild_id: int | None = None, *, register_all: bool = False) -> None:
         super().__init__(timeout=None)
         state = playback.get(guild_id, PlaybackState())
+        self.loop_button.label = "Повтор: вкл" if state.repeat_enabled else "Повтор: выкл"
+        self.loop_button.style = discord.ButtonStyle.success if state.repeat_enabled else discord.ButtonStyle.secondary
         self.add_item(PlaylistSelect(state.playlist))
         songs = SongSelect(state)
         self.add_item(songs)
@@ -782,21 +909,33 @@ class PlayerView(discord.ui.View):
     async def previous(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await handle_player_action(interaction, "previous")
 
+    @discord.ui.button(label="−10 с", emoji="⏪", custom_id="music:rewind", row=0)
+    async def rewind(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await handle_player_action(interaction, "rewind")
+
     @discord.ui.button(label="Пуск / Пауза", emoji="⏯️", style=discord.ButtonStyle.primary, custom_id="music:toggle", row=0)
     async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await handle_player_action(interaction, "toggle")
+
+    @discord.ui.button(label="+10 с", emoji="⏩", custom_id="music:forward", row=0)
+    async def forward(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await handle_player_action(interaction, "forward")
 
     @discord.ui.button(label="Вперёд", emoji="⏭️", custom_id="music:next", row=0)
     async def next_track(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await handle_player_action(interaction, "next")
 
-    @discord.ui.button(label="С начала", emoji="⏮️", custom_id="music:restart", row=0)
+    @discord.ui.button(label="С начала", emoji="⏮️", custom_id="music:restart", row=1)
     async def restart(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await handle_player_action(interaction, "restart")
 
-    @discord.ui.button(label="Песни", emoji="🎵", custom_id="music:songs", row=0)
+    @discord.ui.button(label="Песни", emoji="🎵", custom_id="music:songs", row=4)
     async def songs_list(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await handle_player_action(interaction, "songs")
+
+    @discord.ui.button(label="Повтор: выкл", emoji="🔂", custom_id="music:loop", row=4)
+    async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await handle_player_action(interaction, "loop")
 
     @discord.ui.button(label="−10%", emoji="🔉", custom_id="music:quieter", row=1)
     async def quieter(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -826,7 +965,7 @@ class PlayerView(discord.ui.View):
 
 def build_help_message() -> str:
     order = {name: index for index, name in enumerate((
-        "help", "player", "join", "play", "songs", "now", "pause", "resume", "volume", "stop", "leave"
+        "help", "player", "join", "play", "songs", "now", "pause", "resume", "loop", "volume", "stop", "leave"
     ))}
     usage = {"play": "play <название>", "volume": "volume <0–200>"}
     commands = sorted(bot.tree.get_commands(), key=lambda command: (order.get(command.name, len(order)), command.name))
@@ -842,7 +981,9 @@ def build_help_message() -> str:
         "или `/play` и подсказки названий.\n\n"
         "`/songs`, `/play` и переключение треков работают с выбранным плейлистом. "
         "Громкость меняется без перезапуска песни. "
-        "Кнопка «С начала» запускает текущую песню заново, в том числе с паузы.\n\n"
+        "Кнопка «С начала» запускает текущую песню заново, в том числе с паузы. "
+        "Кнопки «−10 с» и «+10 с» перематывают песню, сохраняя паузу и громкость. "
+        "«Повтор» или `/loop` включает повтор одной песни; «Стоп» отключает его.\n\n"
         "Управлять музыкой могут участники голосового канала бота; "
         "права администратора не нужны. Справка доступна без входа в голосовой канал."
     )
@@ -983,6 +1124,19 @@ async def resume(interaction: discord.Interaction) -> None:
         await interaction.followup.send("▶️ Продолжаю.")
 
 
+@bot.tree.command(name="loop", description="Включить или выключить повтор одной песни")
+async def loop_command(interaction: discord.Interaction) -> None:
+    async with playback_control(interaction) as allowed:
+        if not allowed:
+            return
+        state = playback.setdefault(interaction.guild.id, PlaybackState())
+        state.repeat_enabled = not state.repeat_enabled
+        await interaction.followup.send(
+            "🔂 Повтор одной песни включён." if state.repeat_enabled else "Повтор выключен."
+        )
+    await refresh_player(interaction.guild)
+
+
 @bot.tree.command(name="volume", description="Изменить громкость от 0 до 200 процентов")
 @app_commands.describe(percent="Громкость от 0 до 200")
 async def volume(interaction: discord.Interaction, percent: app_commands.Range[int, 0, 200]) -> None:
@@ -1020,6 +1174,7 @@ async def stop(interaction: discord.Interaction) -> None:
         state = playback.setdefault(interaction.guild.id, PlaybackState())
         state.serial += 1
         state.track = None
+        state.repeat_enabled = False
         voice_client = interaction.guild.voice_client
         if voice_client is not None and (voice_client.is_playing() or voice_client.is_paused()):
             voice_client.stop()
@@ -1031,14 +1186,15 @@ async def leave(interaction: discord.Interaction) -> None:
     async with playback_control(interaction) as allowed:
         if not allowed:
             return
+        state = playback.setdefault(interaction.guild.id, PlaybackState())
+        state.serial += 1
+        state.track = None
+        state.repeat_enabled = False
         if interaction.guild.voice_client is None:
             await interaction.followup.send(
                 "Бот не подключён к голосовому каналу.", ephemeral=True
             )
             return
-        state = playback.setdefault(interaction.guild.id, PlaybackState())
-        state.serial += 1
-        state.track = None
         await interaction.guild.voice_client.disconnect(force=True)
         await interaction.followup.send("👋 Отключился от голосового канала.")
 
