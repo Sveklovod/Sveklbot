@@ -10,7 +10,8 @@ import sys
 import subprocess
 from collections.abc import Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
@@ -35,6 +36,8 @@ SUPPORTED_EXTENSIONS = {
     ".wma",
 }
 SONGS_PER_PAGE = 25
+PLAYLISTS_PER_PAGE = 23  # Leave room for previous/next options in the same menu.
+EMPTY_CHANNEL_TIMEOUT = 5 * 60
 
 
 def configured_path(variable_name: str, default: Path) -> Path:
@@ -73,7 +76,22 @@ class PlaybackState:
     volume_percent: int = 100
     playlist: str = "."
     song_page: int = 0
+    playlist_page: int = 0
     repeat_enabled: bool = False
+
+
+@dataclass
+class ReplyBuffer:
+    interaction: discord.Interaction
+    messages: list[tuple[str, bool]] = field(default_factory=list)
+
+
+@dataclass
+class EmptyChannelCountdown:
+    voice: discord.VoiceClient
+    channel_id: int
+    task: asyncio.Task[None] | None = None
+    disconnecting: bool = False
 
 
 playback: dict[int, PlaybackState] = {}
@@ -81,6 +99,11 @@ player_messages: dict[int, discord.Message | discord.PartialMessage] = {}
 player_locks: dict[int, asyncio.Lock] = {}
 panel_update_locks: dict[int, asyncio.Lock] = {}
 repeat_tasks: set[asyncio.Task[None]] = set()
+panel_refresh_tasks: dict[int, asyncio.Task[None]] = {}
+panel_refresh_dirty: set[int] = set()
+panel_refresh_events: dict[int, asyncio.Event] = {}
+empty_channel_timers: dict[int, EmptyChannelCountdown] = {}
+pending_replies: ContextVar[ReplyBuffer | None] = ContextVar("music_replies", default=None)
 
 
 class VoiceConnectionError(RuntimeError):
@@ -150,24 +173,24 @@ class ProgressAudio(discord.PCMVolumeTransformer[discord.FFmpegPCMAudio]):
 
 
 @lru_cache(maxsize=128)
-def track_duration(track: Path, modified_ns: int, size: int) -> float | None:
+def track_duration(track: Path, modified_ns: int, size: int) -> float:
     # File metadata is part of the cache key so replacing a song invalidates it.
     del modified_ns, size
     executable = shutil.which(FFMPEG_EXECUTABLE or "ffmpeg")
     probe = Path(executable).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe") if executable else None
     if probe is None or not probe.is_file():
-        return None
-    try:
-        result = subprocess.run(
-            [str(probe), "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(track)],
-            capture_output=True, text=True, timeout=5, check=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-        duration = float(result.stdout.strip())
-        return duration if math.isfinite(duration) and duration > 0 else None
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None
+        raise FileNotFoundError("ffprobe не найден.")
+    # lru_cache never caches exceptions. Only successful probes are retained.
+    result = subprocess.run(
+        [str(probe), "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(track)],
+        capture_output=True, text=True, timeout=5, check=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    duration = float(result.stdout.strip())
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("ffprobe вернул некорректную длительность.")
+    return duration
 
 
 def format_time(seconds: float) -> str:
@@ -179,7 +202,7 @@ async def get_track_duration(track: Path) -> float | None:
     try:
         stat = track.stat()
         return await asyncio.to_thread(track_duration, track, stat.st_mtime_ns, stat.st_size)
-    except OSError:
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
 
@@ -217,7 +240,7 @@ async def player_embed(guild: discord.Guild) -> discord.Embed:
     return build_player_embed(guild, duration)
 
 
-async def refresh_player(guild: discord.Guild) -> None:
+async def _refresh_player_once(guild: discord.Guild) -> None:
     # Serialize timer and interaction edits without holding the playback lock.
     # Resolve the active message and build its payload only after taking the
     # update lock, so queued requests cannot resend an older page or playlist.
@@ -237,12 +260,56 @@ async def refresh_player(guild: discord.Guild) -> None:
             logging.warning("Не удалось обновить панель плеера", exc_info=True)
 
 
+async def _refresh_player_worker(guild: discord.Guild) -> None:
+    current_event = None
+    try:
+        while guild.id in panel_refresh_dirty and not bot._music_closing:
+            panel_refresh_dirty.discard(guild.id)
+            current_event = panel_refresh_events.pop(guild.id, None)
+            await _refresh_player_once(guild)
+            if current_event is not None:
+                current_event.set()
+                current_event = None
+    except Exception:
+        logging.exception("Не удалось обновить панель плеера")
+    finally:
+        if current_event is not None:
+            current_event.set()
+        if panel_refresh_tasks.get(guild.id) is asyncio.current_task():
+            panel_refresh_tasks.pop(guild.id, None)
+            panel_refresh_dirty.discard(guild.id)
+            pending = panel_refresh_events.pop(guild.id, None)
+            if pending is not None:
+                pending.set()
+
+
+def request_player_refresh(guild: discord.Guild) -> asyncio.Task[None] | None:
+    """One worker per guild; any number of updates collapse into its next edit."""
+    if bot._music_closing or guild.id not in player_messages:
+        return None
+    panel_refresh_events.setdefault(guild.id, asyncio.Event())
+    panel_refresh_dirty.add(guild.id)
+    task = panel_refresh_tasks.get(guild.id)
+    if task is None or task.done():
+        task = asyncio.create_task(_refresh_player_worker(guild))
+        panel_refresh_tasks[guild.id] = task
+    return task
+
+
+async def refresh_player(guild: discord.Guild) -> None:
+    task = request_player_refresh(guild)
+    if task is not None:
+        # Wait for this requested edit, not for the worker to become idle.
+        # Continuous short repeats must not keep an interaction alive forever.
+        await panel_refresh_events[guild.id].wait()
+
+
 @tasks.loop(seconds=10)
 async def refresh_players() -> None:
     for guild_id in list(player_messages):
         guild = bot.get_guild(guild_id)
         if guild is not None:
-            await refresh_player(guild)
+            request_player_refresh(guild)
 
 
 @refresh_players.before_loop
@@ -280,6 +347,30 @@ def song_token(playlist: str, track: Path) -> str:
 def song_page_bounds(requested: int, track_count: int) -> tuple[int, int]:
     pages = max(1, (track_count + SONGS_PER_PAGE - 1) // SONGS_PER_PAGE)
     return max(0, min(requested, pages - 1)), pages
+
+
+def playlist_page_bounds(requested: int, playlist_count: int) -> tuple[int, int]:
+    pages = max(1, (playlist_count + PLAYLISTS_PER_PAGE - 1) // PLAYLISTS_PER_PAGE)
+    return max(0, min(requested, pages - 1)), pages
+
+
+def build_song_list(playlist: str, tracks: list[Path], *, numbered: bool = True) -> str:
+    header = f"**Плейлист: {discord.utils.escape_markdown(playlist_label(playlist))[:600]}**\n"
+    footer = "\n\nВыбрать песню можно в списке под плейлистами в `/player` или через `/play`."
+    lines: list[str] = []
+    for index, track in enumerate(tracks, 1):
+        prefix = f"{index}. " if numbered else "• "
+        line = prefix + discord.utils.escape_markdown(track.name)
+        remaining = len(tracks) - index
+        tail = f"\n…и ещё {remaining}." if remaining else ""
+        if len(header) + len("\n".join(lines + [line])) + len(tail) + len(footer) > 2000:
+            break
+        lines.append(line)
+    remaining = len(tracks) - len(lines)
+    body = "\n".join(lines) or "В плейлисте пока нет песен."
+    if remaining:
+        body += f"\n…и ещё {remaining}."
+    return header + body + footer
 
 
 def selected_playlist(guild_id: int | None) -> str:
@@ -334,6 +425,77 @@ def find_track(query: str, playlist: str = ".") -> tuple[Path | None, str | None
     return None, "Такой песни нет в выбранном плейлисте. Посмотреть список: `/songs`; сменить плейлист: `/player`."
 
 
+def voice_channel_empty(channel: discord.abc.GuildChannel) -> bool | None:
+    members = getattr(channel, "members", None)
+    if not isinstance(members, (list, tuple)):
+        return None  # Do not disconnect when membership is not known yet.
+    states = getattr(channel, "voice_states", None)
+    if isinstance(states, dict):
+        known = {member.id: member for member in members}
+        # Voice states can be complete while the member cache is not. Treat
+        # unknown occupants as people instead of disconnecting their music.
+        return not any(member_id not in known or not known[member_id].bot for member_id in states)
+    return not any(not member.bot for member in members)
+
+
+def cancel_empty_channel_timer(guild_id: int) -> None:
+    existing = empty_channel_timers.get(guild_id)
+    if existing is not None and existing.disconnecting:
+        return  # The deadline passed; let the committed disconnect finish.
+    countdown = empty_channel_timers.pop(guild_id, None)
+    if countdown is not None and countdown.task is not None:
+        if countdown.task is not asyncio.current_task():
+            countdown.task.cancel()
+
+
+def update_empty_channel_timer(guild: discord.Guild) -> None:
+    voice = guild.voice_client
+    if voice is None or bot._music_closing:
+        cancel_empty_channel_timer(guild.id)
+        return
+    empty = voice_channel_empty(voice.channel)
+    existing = empty_channel_timers.get(guild.id)
+    if empty is False:
+        cancel_empty_channel_timer(guild.id)
+        return
+    if empty is None:
+        if existing is not None and (existing.voice is not voice or existing.channel_id != voice.channel.id):
+            cancel_empty_channel_timer(guild.id)
+        return
+    if (existing is not None and existing.voice is voice and existing.channel_id == voice.channel.id
+            and existing.task is not None and not existing.task.done()):
+        return  # Mutes, deafens and unrelated voice events do not reset the deadline.
+    cancel_empty_channel_timer(guild.id)
+    countdown = EmptyChannelCountdown(voice, voice.channel.id)
+    empty_channel_timers[guild.id] = countdown
+    countdown.task = asyncio.create_task(leave_empty_channel_after_timeout(guild, countdown))
+
+
+async def leave_empty_channel_after_timeout(guild: discord.Guild, countdown: EmptyChannelCountdown) -> None:
+    try:
+        await asyncio.sleep(EMPTY_CHANNEL_TIMEOUT)
+        async with player_locks.setdefault(guild.id, asyncio.Lock()):
+            voice = guild.voice_client
+            if (empty_channel_timers.get(guild.id) is not countdown or voice is not countdown.voice
+                    or voice.channel.id != countdown.channel_id or voice_channel_empty(voice.channel) is not True):
+                return
+            state = playback.setdefault(guild.id, PlaybackState())
+            state.serial += 1
+            state.track = None
+            state.repeat_enabled = False
+            countdown.disconnecting = True
+            await voice.disconnect(force=True)
+            logging.info("Вышел из пустого голосового канала после 5 минут, сервер %s", guild.id)
+        request_player_refresh(guild)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.exception("Не удалось выйти из пустого голосового канала, сервер %s", guild.id)
+    finally:
+        if empty_channel_timers.get(guild.id) is countdown:
+            empty_channel_timers.pop(guild.id, None)
+
+
 class MusicBot(commands.Bot):
     def __init__(self) -> None:
         self._music_closing = False
@@ -358,11 +520,17 @@ class MusicBot(commands.Bot):
     async def close(self) -> None:
         self._music_closing = True
         refresh_players.cancel()
-        pending = tuple(repeat_tasks)
+        pending = set(repeat_tasks) | set(panel_refresh_tasks.values())
+        pending.update(timer.task for timer in empty_channel_timers.values() if timer.task is not None)
+        empty_channel_timers.clear()
         for task in pending:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        panel_refresh_tasks.clear()
+        panel_refresh_dirty.clear()
+        panel_refresh_events.clear()
+        repeat_tasks.clear()
         await super().close()
 
 
@@ -373,11 +541,22 @@ bot = MusicBot()
 async def on_ready() -> None:
     if bot.user is not None:
         print(f"Бот запущен: {bot.user} (ID: {bot.user.id})")
+    for guild in bot.guilds:
+        update_empty_channel_timer(guild)
+
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState) -> None:
+    update_empty_channel_timer(member.guild)
 
 
 async def send_reply(
     interaction: discord.Interaction, message: str, *, ephemeral: bool = False
 ) -> None:
+    buffer = pending_replies.get()
+    if buffer is not None and buffer.interaction is interaction:
+        buffer.messages.append((message, ephemeral))
+        return
     if interaction.response.is_done():
         await interaction.followup.send(message, ephemeral=ephemeral)
     else:
@@ -433,6 +612,7 @@ async def connect_to_user(
         return None
 
     voice_client = interaction.guild.voice_client
+    created_voice = None
     try:
         if voice_client is not None and not voice_client.is_connected():
             logging.info("Восстанавливаю голосовое соединение: сервер %s", interaction.guild.id)
@@ -450,16 +630,25 @@ async def connect_to_user(
                 return None
         if voice_client is None:
             voice_client = await interaction.user.voice.channel.connect(timeout=20.0, reconnect=True)
+            created_voice = voice_client
         # The member may have left or changed channels during the handshake.
         error_message = panel_access_error(interaction)
         if error_message:
+            if created_voice is not None:
+                await created_voice.disconnect(force=True)
             await send_reply(interaction, error_message, ephemeral=True)
             return None
         if not voice_client.is_connected():
             raise VoiceConnectionError("Голосовое соединение не восстановлено после подключения.")
+        update_empty_channel_timer(interaction.guild)
         return voice_client
     except (discord.ClientException, discord.HTTPException, aiohttp.ClientError,
             OSError, TimeoutError, VoiceConnectionError) as error:
+        if created_voice is not None:
+            try:
+                await created_voice.disconnect(force=True)
+            except (discord.DiscordException, aiohttp.ClientError, OSError, TimeoutError):
+                logging.warning("Не удалось закрыть незавершённое голосовое подключение", exc_info=True)
         logging.warning("Не удалось установить голосовое соединение", exc_info=True)
         message = (
             "Не удалось подключиться. Проверь права бота: «Подключаться» и «Говорить»."
@@ -521,10 +710,7 @@ async def repeat_finished_track(guild_id: int, serial: int, track: Path) -> None
                 state.repeat_enabled = False
                 logging.exception("Не удалось повторить песню, сервер %s", guild_id)
     if guild is not None:
-        try:
-            await refresh_player(guild)
-        except Exception:
-            logging.exception("Не удалось обновить панель после повтора, сервер %s", guild_id)
+        request_player_refresh(guild)
 
 
 def create_audio_source(
@@ -613,21 +799,30 @@ def panel_access_error(interaction: discord.Interaction) -> str | None:
 
 
 @asynccontextmanager
-async def playback_control(interaction: discord.Interaction):
+async def playback_control(
+    interaction: discord.Interaction, *, acknowledged: bool = False, check_voice: bool = True
+):
     """Acknowledge immediately; serialize all mutating slash and panel actions."""
-    await interaction.response.defer()
+    if not acknowledged:
+        await interaction.response.defer()
     guild = interaction.guild
     if guild is None:
         await interaction.followup.send("Эта команда работает только на сервере Discord.", ephemeral=True)
         yield False
         return
+    buffer = ReplyBuffer(interaction)
     async with player_locks.setdefault(guild.id, asyncio.Lock()):
-        error = panel_access_error(interaction)
-        if error:
-            await interaction.followup.send(error, ephemeral=True)
-            yield False
-            return
-        yield True
+        token = pending_replies.set(buffer)
+        try:
+            error = panel_access_error(interaction) if check_voice else None
+            if error:
+                buffer.messages.append((error, True))
+            yield error is None
+        finally:
+            pending_replies.reset(token)
+    # Text delivery can be slow or rate limited. The playback lock is free now.
+    for message, ephemeral in buffer.messages:
+        await interaction.followup.send(message, ephemeral=ephemeral)
 
 
 def adjacent_track(tracks: list[Path], current: Path | None, direction: int) -> Path:
@@ -645,40 +840,32 @@ async def handle_player_action(interaction: discord.Interaction, action: str) ->
     if action == "songs":
         playlist = selected_playlist(guild.id)
         tracks = available_tracks(playlist)
-        lines = []
-        for track in tracks:
-            line = f"• {discord.utils.escape_markdown(track.name)}"
-            if len("\n".join(lines)) + len(line) > 1600:
-                lines.append("…остальные песни доступны через /songs и подсказки /play.")
-                break
-            lines.append(line)
         await interaction.followup.send(
-            f"**Плейлист: {discord.utils.escape_markdown(playlist_label(playlist))}**\n"
-            + ("\n".join(lines) or "Папка пуста или была переименована. Выбери плейлист в панели.")
-            + "\n\nВыбрать песню можно в списке под плейлистами или через `/play`.", ephemeral=True,
+            build_song_list(playlist, tracks, numbered=False), ephemeral=True,
         )
         return
-    async with player_locks.setdefault(guild.id, asyncio.Lock()):
-        if action not in {"refresh", "songs_previous", "songs_next"}:
-            error = panel_access_error(interaction)
-            if error:
-                await interaction.followup.send(error, ephemeral=True)
-                return
+    read_only = {"refresh", "songs_previous", "songs_next", "playlists_previous", "playlists_next"}
+    async with playback_control(interaction, acknowledged=True, check_voice=action not in read_only) as allowed:
+        if not allowed:
+            return
         state = playback.setdefault(guild.id, PlaybackState())
         voice = guild.voice_client
-        if action in {"songs_previous", "songs_next"}:
+        if action in {"playlists_previous", "playlists_next"}:
+            page, pages = playlist_page_bounds(state.playlist_page, len(available_playlists()))
+            state.playlist_page = max(0, min(pages - 1, page + (1 if action == "playlists_next" else -1)))
+        elif action in {"songs_previous", "songs_next"}:
             tracks = available_tracks(state.playlist)
             page, pages = song_page_bounds(state.song_page, len(tracks))
             state.song_page = max(0, min(pages - 1, page + (1 if action == "songs_next" else -1)))
         elif action in {"restart", "rewind", "forward"}:
             track = state.track
             if track is None:
-                await interaction.followup.send(
+                await send_reply(interaction,
                     "Сейчас ничего не играет. Сначала выбери песню.", ephemeral=True
                 )
                 return
             if not track.is_file():
-                await interaction.followup.send(
+                await send_reply(interaction,
                     "Файл текущей песни удалён или переименован. Выбери песню заново.",
                     ephemeral=True,
                 )
@@ -687,7 +874,7 @@ async def handle_player_action(interaction: discord.Interaction, action: str) ->
             if action != "restart":
                 source = voice.source if voice is not None else None
                 if not isinstance(source, ProgressAudio) or not (voice.is_playing() or voice.is_paused()):
-                    await interaction.followup.send(
+                    await send_reply(interaction,
                         "Сейчас нет песни, которую можно перемотать. Выбери её заново.", ephemeral=True
                     )
                     return
@@ -696,19 +883,19 @@ async def handle_player_action(interaction: discord.Interaction, action: str) ->
                 # Audio can end while ffprobe is running; never revive an ended track.
                 if (state.serial != serial or state.track != track or guild.voice_client is not voice
                         or voice.source is not source or not (voice.is_playing() or voice.is_paused())):
-                    await interaction.followup.send(
+                    await send_reply(interaction,
                         "Песня уже завершилась. Выбери её заново.", ephemeral=True
                     )
                     return
                 if duration is None:
-                    await interaction.followup.send(
+                    await send_reply(interaction,
                         "Не удалось определить длительность песни для перемотки. Повтори попытку.", ephemeral=True
                     )
                     return
                 current = source.position
                 position = max(0.0, min(max(0.0, duration - 0.02), current + (-10 if action == "rewind" else 10)))
                 if abs(position - current) < 0.001 or (action == "forward" and position < current):
-                    await interaction.followup.send(
+                    await send_reply(interaction,
                         "Достигнуто начало песни." if action == "rewind" else "Достигнут конец песни.",
                         ephemeral=True,
                     )
@@ -733,7 +920,7 @@ async def handle_player_action(interaction: discord.Interaction, action: str) ->
         elif action in {"toggle", "previous", "next"}:
             tracks = available_tracks(state.playlist)
             if not tracks:
-                await interaction.followup.send(
+                await send_reply(interaction,
                     "В выбранном плейлисте нет музыки или его папка переименована. "
                     "Добавь файлы в нужную папку и выбери плейлист в панели.", ephemeral=True
                 )
@@ -741,7 +928,7 @@ async def handle_player_action(interaction: discord.Interaction, action: str) ->
             if len(tracks) == 1 and action != "toggle" and voice is not None and voice.is_connected() and (
                 voice.is_playing() or voice.is_paused()
             ):
-                await interaction.followup.send("В папке пока только одна песня.", ephemeral=True)
+                await send_reply(interaction,"В папке пока только одна песня.", ephemeral=True)
                 return
             track = adjacent_track(tracks, state.track, -1 if action == "previous" else 1)
             voice = await connect_to_user(interaction)
@@ -770,17 +957,12 @@ async def handle_player_action(interaction: discord.Interaction, action: str) ->
 
 
 async def handle_playlist_selection(interaction: discord.Interaction, value: str) -> None:
-    await interaction.response.defer()
-    guild = interaction.guild
-    if guild is None:
-        await interaction.followup.send("Плеер работает только на сервере Discord.", ephemeral=True)
-        return
-    async with player_locks.setdefault(guild.id, asyncio.Lock()):
-        error = panel_access_error(interaction)
-        if error:
-            await interaction.followup.send(error, ephemeral=True)
+    async with playback_control(interaction) as allowed:
+        if not allowed:
             return
-        playlist = next((name for name in available_playlists() if playlist_token(name) == value), None)
+        guild = interaction.guild
+        playlists = list(available_playlists())
+        playlist = next((name for name in playlists if playlist_token(name) == value), None)
         if interaction.message is not None:
             player_messages[guild.id] = interaction.message
         tracks = available_tracks(playlist) if playlist is not None else []
@@ -790,23 +972,23 @@ async def handle_playlist_selection(interaction: discord.Interaction, value: str
                 if playlist is None else
                 f"Плейлист «{playlist_label(playlist)}» пока пуст. Добавь туда музыку и выбери его снова."
             )
-            await interaction.followup.send(message, ephemeral=True)
-            await refresh_player(guild)
-            return
-        state = playback.setdefault(guild.id, PlaybackState())
-        voice = guild.voice_client
-        active = voice is not None and voice.is_connected() and (voice.is_playing() or voice.is_paused())
-        if state.playlist != playlist or not active:
-            voice = await connect_to_user(interaction)
-            if voice is None:
-                return
-            state.playlist = playlist
-            state.song_page = 0
-            try:
-                start_track(voice, guild.id, state, tracks[0])
-            except Exception:
-                state.track = None
-                raise
+            await send_reply(interaction, message, ephemeral=True)
+        else:
+            state = playback.setdefault(guild.id, PlaybackState())
+            state.playlist_page = playlists.index(playlist) // PLAYLISTS_PER_PAGE
+            voice = guild.voice_client
+            active = voice is not None and voice.is_connected() and (voice.is_playing() or voice.is_paused())
+            if state.playlist != playlist or not active:
+                voice = await connect_to_user(interaction)
+                if voice is None:
+                    return
+                state.playlist = playlist
+                state.song_page = 0
+                try:
+                    start_track(voice, guild.id, state, tracks[0])
+                except Exception:
+                    state.track = None
+                    raise
     await refresh_player(guild)
 
 
@@ -822,7 +1004,7 @@ async def handle_song_selection(interaction: discord.Interaction, value: str) ->
         if interaction.message is not None:
             player_messages[guild.id] = interaction.message
         if index is None:
-            await interaction.followup.send(
+            await send_reply(interaction,
                 "Плейлист или список песен изменился. Выбери песню в обновлённом списке.",
                 ephemeral=True,
             )
@@ -843,22 +1025,34 @@ async def handle_song_selection(interaction: discord.Interaction, value: str) ->
 
 
 class PlaylistSelect(discord.ui.Select):
-    def __init__(self, selected: str = ".") -> None:
+    def __init__(self, selected: str = ".", *, page: int | None = None) -> None:
         names = list(available_playlists())
-        visible = names[:25]
-        if selected in names and selected not in visible:
-            visible[-1] = selected
+        requested = names.index(selected) // PLAYLISTS_PER_PAGE if page is None and selected in names else (page or 0)
+        self.page, self.pages = playlist_page_bounds(requested, len(names))
+        start = self.page * PLAYLISTS_PER_PAGE
+        visible = names[start:start + PLAYLISTS_PER_PAGE]
         options = [discord.SelectOption(
             label=playlist_label(name)[:100], value=playlist_token(name),
             default=name == selected,
         ) for name in visible]
+        if self.page > 0:
+            options.insert(0, discord.SelectOption(label="◀ Предыдущая страница плейлистов", value="playlists_previous"))
+        if self.page < self.pages - 1:
+            options.append(discord.SelectOption(label="Следующая страница плейлистов ▶", value="playlists_next"))
+        placeholder = "Выбери плейлист"
+        if self.pages > 1:
+            placeholder += f" • страница {self.page + 1}/{self.pages}"
         super().__init__(
-            placeholder="Выбери плейлист", options=options, min_values=1, max_values=1,
+            placeholder=placeholder, options=options, min_values=1, max_values=1,
             custom_id="music:playlist", row=2,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await handle_playlist_selection(interaction, self.values[0])
+        value = self.values[0]
+        if value in {"playlists_previous", "playlists_next"}:
+            await handle_player_action(interaction, value)
+        else:
+            await handle_playlist_selection(interaction, value)
 
 
 class SongSelect(discord.ui.Select):
@@ -891,7 +1085,7 @@ class PlayerView(discord.ui.View):
         state = playback.get(guild_id, PlaybackState())
         self.loop_button.label = "Повтор: вкл" if state.repeat_enabled else "Повтор: выкл"
         self.loop_button.style = discord.ButtonStyle.success if state.repeat_enabled else discord.ButtonStyle.secondary
-        self.add_item(PlaylistSelect(state.playlist))
+        self.add_item(PlaylistSelect(state.playlist, page=state.playlist_page))
         songs = SongSelect(state)
         self.add_item(songs)
         self.songs_previous.disabled = songs.page == 0
@@ -985,7 +1179,9 @@ def build_help_message() -> str:
         "Кнопки «−10 с» и «+10 с» перематывают песню, сохраняя паузу и громкость. "
         "«Повтор» или `/loop` включает повтор одной песни; «Стоп» отключает его.\n\n"
         "Управлять музыкой могут участники голосового канала бота; "
-        "права администратора не нужны. Справка доступна без входа в голосовой канал."
+        "права администратора не нужны. Справка доступна без входа в голосовой канал. "
+        "Если в голосовом канале нет людей 5 минут, бот выходит. "
+        "Возвращение человека отменяет таймер."
     )
 
 
@@ -1021,7 +1217,7 @@ async def join(interaction: discord.Interaction) -> None:
             return
         voice_client = await connect_to_user(interaction)
         if voice_client is not None:
-            await interaction.followup.send(
+            await send_reply(interaction,
                 f"Подключился к каналу **{voice_client.channel}**."
             )
 
@@ -1038,19 +1234,7 @@ async def songs(interaction: discord.Interaction) -> None:
         )
         return
 
-    lines: list[str] = []
-    current_length = 0
-    for index, track in enumerate(tracks, start=1):
-        line = f"{index}. `{track.name}`"
-        if current_length + len(line) + 1 > 1750:
-            lines.append(f"…и ещё {len(tracks) - index + 1}.")
-            break
-        lines.append(line)
-        current_length += len(line) + 1
-
-    await interaction.response.send_message(
-        f"**Плейлист: {discord.utils.escape_markdown(playlist_label(playlist))}**\n" + "\n".join(lines)
-    )
+    await interaction.response.send_message(build_song_list(playlist, tracks))
 
 
 @bot.tree.command(name="play", description="Включить песню из локальной папки")
@@ -1063,7 +1247,7 @@ async def play(interaction: discord.Interaction, song: str) -> None:
         playlist = selected_playlist(interaction.guild.id)
         track, error_message = find_track(song, playlist)
         if track is None:
-            await interaction.followup.send(error_message, ephemeral=True)
+            await send_reply(interaction,error_message, ephemeral=True)
             return
         voice_client = await connect_to_user(interaction)
         if voice_client is None:
@@ -1075,12 +1259,12 @@ async def play(interaction: discord.Interaction, song: str) -> None:
         except (discord.ClientException, discord.opus.OpusError, discord.opus.OpusNotLoaded, OSError) as error:
             state.track = None
             logging.exception("Не удалось запустить файл", exc_info=error)
-            await interaction.followup.send(
+            await send_reply(interaction,
                 "Не удалось запустить файл. Проверь FFmpeg; подробности в `bot.log`.", ephemeral=True
             )
             return
 
-        await interaction.followup.send(f"▶️ Сейчас играет: **{track.name}**")
+        await send_reply(interaction,f"▶️ Сейчас играет: **{track.name}**")
 
 
 @bot.tree.command(name="now", description="Показать текущую песню")
@@ -1105,10 +1289,10 @@ async def pause(interaction: discord.Interaction) -> None:
             return
         voice_client = interaction.guild.voice_client
         if voice_client is None or not voice_client.is_playing():
-            await interaction.followup.send("Сейчас ничего не играет.", ephemeral=True)
+            await send_reply(interaction,"Сейчас ничего не играет.", ephemeral=True)
             return
         voice_client.pause()
-        await interaction.followup.send("⏸️ Пауза.")
+        await send_reply(interaction,"⏸️ Пауза.")
 
 
 @bot.tree.command(name="resume", description="Продолжить воспроизведение")
@@ -1118,10 +1302,10 @@ async def resume(interaction: discord.Interaction) -> None:
             return
         voice_client = interaction.guild.voice_client
         if voice_client is None or not voice_client.is_paused():
-            await interaction.followup.send("Музыка не стоит на паузе.", ephemeral=True)
+            await send_reply(interaction,"Музыка не стоит на паузе.", ephemeral=True)
             return
         voice_client.resume()
-        await interaction.followup.send("▶️ Продолжаю.")
+        await send_reply(interaction,"▶️ Продолжаю.")
 
 
 @bot.tree.command(name="loop", description="Включить или выключить повтор одной песни")
@@ -1131,7 +1315,7 @@ async def loop_command(interaction: discord.Interaction) -> None:
             return
         state = playback.setdefault(interaction.guild.id, PlaybackState())
         state.repeat_enabled = not state.repeat_enabled
-        await interaction.followup.send(
+        await send_reply(interaction,
             "🔂 Повтор одной песни включён." if state.repeat_enabled else "Повтор выключен."
         )
     await refresh_player(interaction.guild)
@@ -1149,21 +1333,21 @@ async def volume(interaction: discord.Interaction, percent: app_commands.Range[i
         if voice_client is None or state.track is None or not (
             voice_client.is_playing() or voice_client.is_paused()
         ):
-            await interaction.followup.send(
+            await send_reply(interaction,
                 f"🔊 Громкость **{percent}%** применится к следующей песне."
             )
             return
 
         source = voice_client.source
         if not isinstance(source, discord.PCMVolumeTransformer):
-            await interaction.followup.send(
+            await send_reply(interaction,
                 "У текущего потока нет регулировки громкости. "
                 "Новое значение применится к следующей песне.", ephemeral=True
             )
             return
 
         source.volume = percent / 100
-        await interaction.followup.send(f"🔊 Громкость: **{percent}%**.")
+        await send_reply(interaction,f"🔊 Громкость: **{percent}%**.")
 
 
 @bot.tree.command(name="stop", description="Остановить музыку")
@@ -1178,7 +1362,7 @@ async def stop(interaction: discord.Interaction) -> None:
         voice_client = interaction.guild.voice_client
         if voice_client is not None and (voice_client.is_playing() or voice_client.is_paused()):
             voice_client.stop()
-        await interaction.followup.send("⏹️ Воспроизведение остановлено.")
+        await send_reply(interaction,"⏹️ Воспроизведение остановлено.")
 
 
 @bot.tree.command(name="leave", description="Отключить бота от голосового канала")
@@ -1190,13 +1374,14 @@ async def leave(interaction: discord.Interaction) -> None:
         state.serial += 1
         state.track = None
         state.repeat_enabled = False
+        cancel_empty_channel_timer(interaction.guild.id)
         if interaction.guild.voice_client is None:
-            await interaction.followup.send(
+            await send_reply(interaction,
                 "Бот не подключён к голосовому каналу.", ephemeral=True
             )
             return
         await interaction.guild.voice_client.disconnect(force=True)
-        await interaction.followup.send("👋 Отключился от голосового канала.")
+        await send_reply(interaction,"👋 Отключился от голосового канала.")
 
 
 def main() -> None:
