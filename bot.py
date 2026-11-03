@@ -550,6 +550,36 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     update_empty_channel_timer(member.guild)
 
 
+async def send_deferred_reply(
+    interaction: discord.Interaction, message: str | None = None, *, ephemeral: bool = False, **payload
+) -> discord.WebhookMessage | None:
+    """Keep private slash acknowledgements separate from public results."""
+    extras = getattr(interaction, "extras", {})
+    completed_key = "sveklobot:defer_completed"
+    pending = (
+        getattr(interaction.response, "type", None)
+        == discord.InteractionResponseType.deferred_channel_message
+        and not extras.get(completed_key, False)
+    )
+    args = (message,) if message is not None else ()
+    if ephemeral or not pending:
+        result = await interaction.followup.send(*args, ephemeral=ephemeral, **payload)
+        extras[completed_key] = True
+        return result
+
+    # Discord's first followup would inherit the private defer. Complete it
+    # explicitly first so the next webhook message can really be public.
+    await interaction.edit_original_response(content="Готово.")
+    extras[completed_key] = True
+    try:
+        return await interaction.followup.send(*args, ephemeral=False, **payload)
+    finally:
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException as error:
+            logging.warning("Не удалось убрать личное подтверждение команды: %s", error)
+
+
 async def send_reply(
     interaction: discord.Interaction, message: str, *, ephemeral: bool = False
 ) -> None:
@@ -558,7 +588,7 @@ async def send_reply(
         buffer.messages.append((message, ephemeral))
         return
     if interaction.response.is_done():
-        await interaction.followup.send(message, ephemeral=ephemeral)
+        await send_deferred_reply(interaction, message, ephemeral=ephemeral)
     else:
         await interaction.response.send_message(message, ephemeral=ephemeral)
 
@@ -804,10 +834,12 @@ async def playback_control(
 ):
     """Acknowledge immediately; serialize all mutating slash and panel actions."""
     if not acknowledged:
-        await interaction.response.defer()
+        # For components this remains a deferred message update; only slash
+        # commands create a private loading message.
+        await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
     if guild is None:
-        await interaction.followup.send("Эта команда работает только на сервере Discord.", ephemeral=True)
+        await send_deferred_reply(interaction, "Эта команда работает только на сервере Discord.", ephemeral=True)
         yield False
         return
     buffer = ReplyBuffer(interaction)
@@ -822,7 +854,7 @@ async def playback_control(
             pending_replies.reset(token)
     # Text delivery can be slow or rate limited. The playback lock is free now.
     for message, ephemeral in buffer.messages:
-        await interaction.followup.send(message, ephemeral=ephemeral)
+        await send_deferred_reply(interaction, message, ephemeral=ephemeral)
 
 
 def adjacent_track(tracks: list[Path], current: Path | None, direction: int) -> Path:
@@ -1193,16 +1225,16 @@ async def help_command(interaction: discord.Interaction) -> None:
 @bot.tree.command(name="player", description="Открыть музыкальную панель с кнопками")
 @app_commands.guild_only()
 async def player(interaction: discord.Interaction) -> None:
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)
     if interaction.guild is None:
-        await interaction.followup.send("Плеер работает только на сервере Discord.", ephemeral=True)
+        await send_deferred_reply(interaction, "Плеер работает только на сервере Discord.", ephemeral=True)
         return
     if not interaction.app_permissions.embed_links:
-        await interaction.followup.send(
+        await send_deferred_reply(interaction,
             "Для панели дай боту право «Встраивать ссылки» в этом текстовом канале.", ephemeral=True
         )
         return
-    message = await interaction.followup.send(
+    message = await send_deferred_reply(interaction,
         embed=await player_embed(interaction.guild), view=PlayerView(interaction.guild.id), wait=True,
     )
     # Use a normal bot-authenticated message for edits after the interaction
