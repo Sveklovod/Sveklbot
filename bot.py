@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import aiohttp
@@ -38,6 +39,8 @@ SUPPORTED_EXTENSIONS = {
 SONGS_PER_PAGE = 25
 PLAYLISTS_PER_PAGE = 23  # Leave room for previous/next options in the same menu.
 EMPTY_CHANNEL_TIMEOUT = 5 * 60
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
 
 
 def configured_path(variable_name: str, default: Path) -> Path:
@@ -51,8 +54,63 @@ def configured_path(variable_name: str, default: Path) -> Path:
     return path.resolve()
 
 
+def configured_executable(
+    variable_name: str, default_name: str = "", *, base_dir: Path = BASE_DIR
+) -> str | None:
+    """Resolve an executable from the environment; relative paths use the bot folder."""
+    value = os.getenv(variable_name, "").strip()
+    if not value:
+        return shutil.which(default_name) if default_name else None
+
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return str(path.resolve())
+    local_path = base_dir / path
+    if local_path.is_file() or len(path.parts) > 1:
+        return str(local_path.resolve())
+    return shutil.which(value)
+
+
+def resolve_ffprobe(ffmpeg_executable: str | None) -> Path | None:
+    """Find ffprobe next to FFmpeg first, then on PATH; it is optional."""
+    if ffmpeg_executable:
+        neighbour = Path(ffmpeg_executable).with_name(
+            "ffprobe.exe" if os.name == "nt" else "ffprobe"
+        )
+        if neighbour.is_file():
+            return neighbour
+    found = shutil.which("ffprobe")
+    if found:
+        candidate = Path(found)
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def ffmpeg_unavailable_reason(executable: str | None) -> str | None:
+    """Return a human-readable startup error, or None when FFmpeg can be used."""
+    if not executable:
+        return (
+            "FFmpeg не найден. Установи FFmpeg или укажи путь к ffmpeg.exe "
+            "в переменной FFMPEG_PATH в файле .env."
+        )
+    path = Path(executable)
+    if not path.is_file():
+        return (
+            f"FFmpeg не найден по пути «{executable}». Проверь переменную FFMPEG_PATH "
+            "в файле .env: путь указан неверно или файл перемещён."
+        )
+    if os.name != "nt" and not os.access(path, os.X_OK):
+        return (
+            f"Файл «{executable}» не является исполняемым. Проверь права доступа "
+            "и переменную FFMPEG_PATH в файле .env."
+        )
+    return None
+
+
 MUSIC_DIR = configured_path("MUSIC_DIR", BASE_DIR / "music")
-FFMPEG_EXECUTABLE = os.getenv("FFMPEG_PATH", "").strip() or shutil.which("ffmpeg")
+FFMPEG_EXECUTABLE = configured_executable("FFMPEG_PATH", "ffmpeg")
+FFPROBE_EXECUTABLE = resolve_ffprobe(FFMPEG_EXECUTABLE)
 
 
 def get_test_guild_id() -> int | None:
@@ -176,8 +234,7 @@ class ProgressAudio(discord.PCMVolumeTransformer[discord.FFmpegPCMAudio]):
 def track_duration(track: Path, modified_ns: int, size: int) -> float:
     # File metadata is part of the cache key so replacing a song invalidates it.
     del modified_ns, size
-    executable = shutil.which(FFMPEG_EXECUTABLE or "ffmpeg")
-    probe = Path(executable).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe") if executable else None
+    probe = FFPROBE_EXECUTABLE
     if probe is None or not probe.is_file():
         raise FileNotFoundError("ffprobe не найден.")
     # lru_cache never caches exceptions. Only successful probes are retained.
@@ -206,10 +263,19 @@ async def get_track_duration(track: Path) -> float | None:
         return None
 
 
+def seek_duration_error() -> str:
+    if FFPROBE_EXECUTABLE is None:
+        return (
+            "Для перемотки нужен ffprobe, а он не найден рядом с FFmpeg или в PATH. "
+            "Установи полный набор FFmpeg (ffmpeg и ffprobe) или исправь FFMPEG_PATH в .env."
+        )
+    return "Не удалось определить длительность песни для перемотки. Повтори попытку."
+
+
 def build_player_embed(guild: discord.Guild, duration: float | None) -> discord.Embed:
     state = playback.get(guild.id, PlaybackState())
     voice = guild.voice_client
-    active = voice is not None and (voice.is_playing() or voice.is_paused())
+    active = voice is not None and voice.is_connected() and (voice.is_playing() or voice.is_paused())
     embed = discord.Embed(title="🎵 Музыкальный плеер", colour=0x5865F2)
     if active and state.track is not None:
         position = voice.source.position if isinstance(voice.source, ProgressAudio) else 0
@@ -224,9 +290,13 @@ def build_player_embed(guild: discord.Guild, duration: float | None) -> discord.
     embed.add_field(name="Плейлист", value=discord.utils.escape_markdown(playlist_label(state.playlist))[:1024], inline=True)
     embed.add_field(name="Громкость", value=f"{state.volume_percent}%", inline=True)
     embed.add_field(name="Повтор", value="Одна песня" if state.repeat_enabled else "Выключен", inline=True)
-    if voice is not None:
-        embed.add_field(name="Канал", value=voice.channel.mention, inline=True)
-    embed.set_footer(text="Локальная музыка • обновление каждые 10 с • /player")
+    channel = getattr(voice, "channel", None) if voice is not None else None
+    if channel is not None:
+        embed.add_field(name="Канал", value=channel.mention, inline=True)
+    footer = "Локальная музыка • обновление каждые 10 с • /player"
+    if FFPROBE_EXECUTABLE is None:
+        footer += " • ffprobe не найден, перемотка недоступна"
+    embed.set_footer(text=footer)
     return embed
 
 
@@ -453,20 +523,25 @@ def update_empty_channel_timer(guild: discord.Guild) -> None:
     if voice is None or bot._music_closing:
         cancel_empty_channel_timer(guild.id)
         return
-    empty = voice_channel_empty(voice.channel)
+    channel = getattr(voice, "channel", None)
+    if channel is None:
+        # Membership is unknown while the client reconnects; keep the deadline
+        # untouched and re-check it on the next voice event or when it fires.
+        return
+    empty = voice_channel_empty(channel)
     existing = empty_channel_timers.get(guild.id)
     if empty is False:
         cancel_empty_channel_timer(guild.id)
         return
     if empty is None:
-        if existing is not None and (existing.voice is not voice or existing.channel_id != voice.channel.id):
+        if existing is not None and (existing.voice is not voice or existing.channel_id != channel.id):
             cancel_empty_channel_timer(guild.id)
         return
-    if (existing is not None and existing.voice is voice and existing.channel_id == voice.channel.id
+    if (existing is not None and existing.voice is voice and existing.channel_id == channel.id
             and existing.task is not None and not existing.task.done()):
         return  # Mutes, deafens and unrelated voice events do not reset the deadline.
     cancel_empty_channel_timer(guild.id)
-    countdown = EmptyChannelCountdown(voice, voice.channel.id)
+    countdown = EmptyChannelCountdown(voice, channel.id)
     empty_channel_timers[guild.id] = countdown
     countdown.task = asyncio.create_task(leave_empty_channel_after_timeout(guild, countdown))
 
@@ -476,8 +551,10 @@ async def leave_empty_channel_after_timeout(guild: discord.Guild, countdown: Emp
         await asyncio.sleep(EMPTY_CHANNEL_TIMEOUT)
         async with player_locks.setdefault(guild.id, asyncio.Lock()):
             voice = guild.voice_client
+            channel = getattr(voice, "channel", None) if voice is not None else None
             if (empty_channel_timers.get(guild.id) is not countdown or voice is not countdown.voice
-                    or voice.channel.id != countdown.channel_id or voice_channel_empty(voice.channel) is not True):
+                    or channel is None or channel.id != countdown.channel_id
+                    or voice_channel_empty(channel) is not True):
                 return
             state = playback.setdefault(guild.id, PlaybackState())
             state.serial += 1
@@ -643,14 +720,18 @@ async def connect_to_user(
 
     voice_client = interaction.guild.voice_client
     created_voice = None
+    stale_state: PlaybackState | None = None
     try:
         if voice_client is not None and not voice_client.is_connected():
             logging.info("Восстанавливаю голосовое соединение: сервер %s", interaction.guild.id)
             state = playback.get(interaction.guild.id)
             if state is not None:
-                # disconnect() stops the old audio thread. Ignore its late callback.
+                # disconnect() stops the old audio thread. Invalidate its late
+                # callback now, but keep the selected song until the new link
+                # is actually up: a failed retry must not turn the next
+                # "Пуск / Пауза" into "play the first song".
                 state.serial += 1
-                state.track = None
+                stale_state = state
             await voice_client.disconnect(force=True)
             voice_client = None
             # Disconnecting can take time; never join on behalf of someone who left.
@@ -670,6 +751,10 @@ async def connect_to_user(
             return None
         if not voice_client.is_connected():
             raise VoiceConnectionError("Голосовое соединение не восстановлено после подключения.")
+        if stale_state is not None:
+            # The old audio is gone; only forget the selected song once the
+            # connection has really been restored.
+            stale_state.track = None
         update_empty_channel_timer(interaction.guild)
         return voice_client
     except (discord.ClientException, discord.HTTPException, aiohttp.ClientError,
@@ -823,8 +908,10 @@ def panel_access_error(interaction: discord.Interaction) -> str | None:
     if user_voice is None or user_voice.channel is None:
         return "Сначала зайди в голосовой канал."
     voice = interaction.guild.voice_client
-    if voice is not None and voice.channel.id != user_voice.channel.id:
-        return "Для управления зайди в тот же голосовой канал, что и бот."
+    if voice is not None:
+        channel = getattr(voice, "channel", None)
+        if channel is not None and channel.id != user_voice.channel.id:
+            return "Для управления зайди в тот же голосовой канал, что и бот."
     return None
 
 
@@ -920,9 +1007,7 @@ async def handle_player_action(interaction: discord.Interaction, action: str) ->
                     )
                     return
                 if duration is None:
-                    await send_reply(interaction,
-                        "Не удалось определить длительность песни для перемотки. Повтори попытку.", ephemeral=True
-                    )
+                    await send_reply(interaction, seek_duration_error(), ephemeral=True)
                     return
                 current = source.position
                 position = max(0.0, min(max(0.0, duration - 0.02), current + (-10 if action == "rewind" else 10)))
@@ -962,7 +1047,12 @@ async def handle_player_action(interaction: discord.Interaction, action: str) ->
             ):
                 await send_reply(interaction,"В папке пока только одна песня.", ephemeral=True)
                 return
-            track = adjacent_track(tracks, state.track, -1 if action == "previous" else 1)
+            if action == "toggle":
+                # Resume the current song when possible; do not silently take
+                # the next one because playback state is stale after a loss.
+                track = state.track if state.track in tracks else tracks[0]
+            else:
+                track = adjacent_track(tracks, state.track, -1 if action == "previous" else 1)
             voice = await connect_to_user(interaction)
             if voice is None:
                 return
@@ -1249,8 +1339,10 @@ async def join(interaction: discord.Interaction) -> None:
             return
         voice_client = await connect_to_user(interaction)
         if voice_client is not None:
+            channel = getattr(voice_client, "channel", None)
             await send_reply(interaction,
-                f"Подключился к каналу **{voice_client.channel}**."
+                f"Подключился к каналу **{channel}**." if channel is not None
+                else "Подключился к голосовому каналу."
             )
 
 
@@ -1273,6 +1365,7 @@ async def songs(interaction: discord.Interaction) -> None:
 @app_commands.describe(song="Имя файла или часть названия")
 @app_commands.autocomplete(song=song_autocomplete)
 async def play(interaction: discord.Interaction, song: str) -> None:
+    started = False
     async with playback_control(interaction) as allowed:
         if not allowed:
             return
@@ -1297,6 +1390,9 @@ async def play(interaction: discord.Interaction, song: str) -> None:
             return
 
         await send_reply(interaction,f"▶️ Сейчас играет: **{track.name}**")
+        started = True
+    if started:
+        request_player_refresh(interaction.guild)
 
 
 @bot.tree.command(name="now", description="Показать текущую песню")
@@ -1308,7 +1404,25 @@ async def now(interaction: discord.Interaction) -> None:
         return
 
     state = playback.get(interaction.guild.id)
+    voice = interaction.guild.voice_client
     if state is None or state.track is None:
+        await interaction.response.send_message("Сейчас ничего не играет.")
+        return
+    if voice is None:
+        await interaction.response.send_message(
+            "Соединение с голосовым каналом потеряно. Включи музыку заново командой "
+            "`/play` или кнопкой «Пуск / Пауза» на панели."
+        )
+        return
+    if not voice.is_connected():
+        await interaction.response.send_message(
+            f"🎵 Песня: **{state.track.name}**. Голосовое соединение восстанавливается; "
+            "если музыка не вернётся, включи её заново через `/play` или «Пуск / Пауза»."
+        )
+        return
+    if not (voice.is_playing() or voice.is_paused()):
+        # The song can be remembered for the next "Пуск / Пауза" while nothing
+        # is actually playing yet (for example, after /join).
         await interaction.response.send_message("Сейчас ничего не играет.")
         return
     await interaction.response.send_message(f"🎵 Сейчас играет: **{state.track.name}**")
@@ -1325,6 +1439,7 @@ async def pause(interaction: discord.Interaction) -> None:
             return
         voice_client.pause()
         await send_reply(interaction,"⏸️ Пауза.")
+    request_player_refresh(interaction.guild)
 
 
 @bot.tree.command(name="resume", description="Продолжить воспроизведение")
@@ -1338,6 +1453,7 @@ async def resume(interaction: discord.Interaction) -> None:
             return
         voice_client.resume()
         await send_reply(interaction,"▶️ Продолжаю.")
+    request_player_refresh(interaction.guild)
 
 
 @bot.tree.command(name="loop", description="Включить или выключить повтор одной песни")
@@ -1368,18 +1484,17 @@ async def volume(interaction: discord.Interaction, percent: app_commands.Range[i
             await send_reply(interaction,
                 f"🔊 Громкость **{percent}%** применится к следующей песне."
             )
-            return
-
-        source = voice_client.source
-        if not isinstance(source, discord.PCMVolumeTransformer):
-            await send_reply(interaction,
-                "У текущего потока нет регулировки громкости. "
-                "Новое значение применится к следующей песне.", ephemeral=True
-            )
-            return
-
-        source.volume = percent / 100
-        await send_reply(interaction,f"🔊 Громкость: **{percent}%**.")
+        else:
+            source = voice_client.source
+            if not isinstance(source, discord.PCMVolumeTransformer):
+                await send_reply(interaction,
+                    "У текущего потока нет регулировки громкости. "
+                    "Новое значение применится к следующей песне.", ephemeral=True
+                )
+            else:
+                source.volume = percent / 100
+                await send_reply(interaction,f"🔊 Громкость: **{percent}%**.")
+    request_player_refresh(interaction.guild)
 
 
 @bot.tree.command(name="stop", description="Остановить музыку")
@@ -1395,6 +1510,7 @@ async def stop(interaction: discord.Interaction) -> None:
         if voice_client is not None and (voice_client.is_playing() or voice_client.is_paused()):
             voice_client.stop()
         await send_reply(interaction,"⏹️ Воспроизведение остановлено.")
+    request_player_refresh(interaction.guild)
 
 
 @bot.tree.command(name="leave", description="Отключить бота от голосового канала")
@@ -1416,27 +1532,42 @@ async def leave(interaction: discord.Interaction) -> None:
         await send_reply(interaction,"👋 Отключился от голосового канала.")
 
 
+def build_log_handlers(log_path: Path | None = None) -> list[logging.Handler]:
+    """Bound bot.log growth: rotate at 5 MiB and keep three previous files."""
+    path = log_path if log_path is not None else BASE_DIR / "bot.log"
+    return [
+        RotatingFileHandler(
+            path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
+        ),
+        logging.StreamHandler(),
+    ]
+
+
 def main() -> None:
     token = os.getenv("DISCORD_TOKEN", "").strip()
     if not token:
         raise SystemExit(
             "Не найден DISCORD_TOKEN. Скопируй .env.example в .env и вставь токен."
         )
-    if FFMPEG_EXECUTABLE is None:
-        raise SystemExit(
-            "FFmpeg не найден. Установи его или укажи путь к ffmpeg.exe в FFMPEG_PATH."
-        )
+    ffmpeg_error = ffmpeg_unavailable_reason(FFMPEG_EXECUTABLE)
+    if ffmpeg_error:
+        raise SystemExit(ffmpeg_error)
 
     MUSIC_DIR.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(BASE_DIR / "bot.log", encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
+        handlers=build_log_handlers(),
         force=True,
     )
+    logging.info("FFmpeg: %s", FFMPEG_EXECUTABLE)
+    if FFPROBE_EXECUTABLE is None:
+        logging.warning(
+            "ffprobe не найден: длительность трека и перемотка будут недоступны, "
+            "остальные функции работают."
+        )
+    else:
+        logging.info("ffprobe: %s", FFPROBE_EXECUTABLE)
     logging.info(
         "Запуск бота: PID=%s, Python=%s, discord.py=%s, аудио=PCM + native Opus, "
         "подтверждение /pause до обработки",
