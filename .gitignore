@@ -11,6 +11,7 @@ venv/
 __pycache__/
 *.py[cod]
 *.log
+*.log.*
 .pytest_cache/
 
 # Private runtime data and Windows binaries
