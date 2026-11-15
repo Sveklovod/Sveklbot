@@ -39,6 +39,7 @@ SUPPORTED_EXTENSIONS = {
 SONGS_PER_PAGE = 25
 PLAYLISTS_PER_PAGE = 23  # Leave room for previous/next options in the same menu.
 EMPTY_CHANNEL_TIMEOUT = 5 * 60
+PANEL_EDIT_MIN_INTERVAL = 6.0
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 
@@ -160,6 +161,7 @@ repeat_tasks: set[asyncio.Task[None]] = set()
 panel_refresh_tasks: dict[int, asyncio.Task[None]] = {}
 panel_refresh_dirty: set[int] = set()
 panel_refresh_events: dict[int, asyncio.Event] = {}
+panel_last_edit: dict[int, float] = {}
 empty_channel_timers: dict[int, EmptyChannelCountdown] = {}
 pending_replies: ContextVar[ReplyBuffer | None] = ContextVar("music_replies", default=None)
 
@@ -322,7 +324,13 @@ async def _refresh_player_once(guild: discord.Guild) -> None:
             embed = await player_embed(guild)
             if player_messages.get(guild.id) is not message:
                 return  # Another panel became active while metadata was loading.
-            await message.edit(embed=embed, view=PlayerView(guild.id))
+            view = PlayerView(guild.id)
+            try:
+                await message.edit(embed=embed, view=view)
+            finally:
+                # Count failed and slow requests too; retries can themselves
+                # take time and must not be followed by another burst.
+                panel_last_edit[guild.id] = asyncio.get_running_loop().time()
         except (discord.NotFound, discord.Forbidden):
             if player_messages.get(guild.id) is message:
                 player_messages.pop(guild.id, None)
@@ -334,6 +342,13 @@ async def _refresh_player_worker(guild: discord.Guild) -> None:
     current_event = None
     try:
         while guild.id in panel_refresh_dirty and not bot._music_closing:
+            last_edit = panel_last_edit.get(guild.id)
+            if last_edit is not None:
+                delay = PANEL_EDIT_MIN_INTERVAL - (asyncio.get_running_loop().time() - last_edit)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+            # Leave the event in place while waiting so all requests arriving
+            # during the cooldown share this single, up-to-date edit.
             panel_refresh_dirty.discard(guild.id)
             current_event = panel_refresh_events.pop(guild.id, None)
             await _refresh_player_once(guild)
@@ -607,6 +622,7 @@ class MusicBot(commands.Bot):
         panel_refresh_tasks.clear()
         panel_refresh_dirty.clear()
         panel_refresh_events.clear()
+        panel_last_edit.clear()
         repeat_tasks.clear()
         await super().close()
 
